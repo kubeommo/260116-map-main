@@ -1,30 +1,48 @@
 /*************************************************
- * heatmap.js (성남시 안전도 히트맵)
+ * heatmap.js
+ * 성남시 격자 기반 위험도 히트맵 (weight 0~1 기준)
+ * - 시설 있는 격자 안전 (파랑~초록~노랑)
+ * - 시설 없는 격자 최대 위험 (빨강)
+ * - 데이터 외곽 기준으로 바깥쪽 격자 제거
+ * - 성남시 외곽 제외
+ * - 자연스럽게 연결
+ * - 줌/이동/데이터 로딩 완전 연동
  *************************************************/
 
-console.log('🔥 성남시 안전도 히트맵 로딩');
+console.log('🔴 heatmap.js 로딩');
 
+// =========================
+// 설정
+// =========================
+const MIN_RENDER_WEIGHT = 0.05;
+
+const FACILITY_WEIGHT = {
+    cctv: 0.18,
+    police: 0.30,
+    street: 0.12
+};
+
+// =========================
+// 히트맵 레이어
+// =========================
 const heatSource = new ol.source.Vector();
 
 const heatLayer = new ol.layer.Heatmap({
     source: heatSource,
-    radius: 32,
-    blur: 45,
-    visible: false,
+    radius: 40,
+    blur: 50,
     weight: f => f.get('weight'),
-    gradient: [
-        'rgba(255, 0, 0, 1.0)',   // 위험
-        'rgba(255, 255, 0, 0.9)',
-        'rgba(0, 255, 0, 0.85)',
-        'rgba(0, 0, 255, 0.9)'   // 안전
-    ]
+    gradient: ['#0000ff','#00ff00','#ffff00','#ff0000'], // 파랑→초록→노랑→빨강
+    visible: false,
+    opacity: 0.6,
+    zIndex: 5
 });
 
 map.addLayer(heatLayer);
 
-/* =========================
-   성남시 BBOX (위경도)
-========================= */
+// =========================
+// 성남시 BBOX
+// =========================
 const SEONGNAM_BBOX = {
     minLon: 127.05,
     maxLon: 127.20,
@@ -32,7 +50,8 @@ const SEONGNAM_BBOX = {
     maxLat: 37.46
 };
 
-function isInSeongnam(lon, lat) {
+function isInSeongnam3857(coord) {
+    const [lon, lat] = ol.proj.toLonLat(coord);
     return (
         lon >= SEONGNAM_BBOX.minLon &&
         lon <= SEONGNAM_BBOX.maxLon &&
@@ -41,80 +60,118 @@ function isInSeongnam(lon, lat) {
     );
 }
 
-/* =========================
-   GRID 기반 안전도 계산
-========================= */
-function buildSafetyHeatmap() {
+// =========================
+// 줌 → 격자 크기
+// =========================
+function getGridSizeByZoom(zoom) {
+    if (zoom >= 16) return 150;
+    if (zoom >= 15) return 220;
+    if (zoom >= 14) return 300;
+    if (zoom >= 13) return 400;
+    return 600;
+}
+
+// =========================
+// 히트맵 재생성
+// =========================
+function rebuildHeatmapByView() {
+    if (!heatLayer.getVisible()) return;
+
     heatSource.clear();
 
-    const GRID_SIZE = 0.0015; // 약 150m
-    const gridMap = new Map();
+    const zoom = map.getView().getZoom();
+    const GRID_SIZE = getGridSizeByZoom(zoom);
 
-    function addToGrid(source, type) {
+    const gridScore = new Map();
+
+    function accumulate(source, weight) {
         if (!source) return;
-
         source.getFeatures().forEach(f => {
-            const [lon, lat] = ol.proj.toLonLat(
-                f.getGeometry().getCoordinates()
-            );
+            const coord = f.getGeometry().getCoordinates();
+            if (!isInSeongnam3857(coord)) return;
 
-            // 🔥 성남시 아닌 데이터 제거
-            if (!isInSeongnam(lon, lat)) return;
+            const gx = Math.floor(coord[0] / GRID_SIZE) * GRID_SIZE;
+            const gy = Math.floor(coord[1] / GRID_SIZE) * GRID_SIZE;
+            const key = `${gx},${gy}`;
 
-            const gx = Math.floor(lon / GRID_SIZE);
-            const gy = Math.floor(lat / GRID_SIZE);
-            const key = `${gx}_${gy}`;
-
-            if (!gridMap.has(key)) {
-                gridMap.set(key, {
-                    lon,
-                    lat,
-                    cctv: 0,
-                    police: 0,
-                    street: 0
-                });
-            }
-
-            gridMap.get(key)[type]++;
+            gridScore.set(key, (gridScore.get(key) || 0) + weight);
         });
     }
 
-    // ▶ 성남시 데이터만 누적
-    addToGrid(cctvSource, 'cctv');
-    addToGrid(policeSource, 'police');
-    addToGrid(streetSource, 'street');
+    accumulate(cctvSource, FACILITY_WEIGHT.cctv);
+    accumulate(policeSource, FACILITY_WEIGHT.police);
+    accumulate(streetSource, FACILITY_WEIGHT.street);
 
-    // ▶ 히트맵 포인트 생성
-    gridMap.forEach(g => {
-        const score =
-            g.cctv * 0.6 +
-            g.police * 0.9 +
-            g.street * 0.4;
+    if (gridScore.size === 0) return;
 
-        if (score <= 0) return;
+    const cells = [...gridScore.keys()].map(k => k.split(',').map(Number));
+    let minX = Math.min(...cells.map(c => c[0]));
+    let maxX = Math.max(...cells.map(c => c[0]));
+    let minY = Math.min(...cells.map(c => c[1]));
+    let maxY = Math.max(...cells.map(c => c[1]));
 
-        // 🔵 안전도 → weight
-        const weight = Math.min(score / 3.0, 1.0);
+    // =========================
+    // 격자 생성: 데이터 바깥쪽 격자 제거
+    // =========================
+    for (let x = minX; x <= maxX; x += GRID_SIZE) {
+        for (let y = minY; y <= maxY; y += GRID_SIZE) {
+            const center = [x + GRID_SIZE / 2, y + GRID_SIZE / 2];
+            if (!isInSeongnam3857(center)) continue;
 
-        heatSource.addFeature(
-            new ol.Feature({
-                geometry: new ol.geom.Point(
-                    ol.proj.fromLonLat([g.lon, g.lat])
-                ),
+            const key = `${x},${y}`;
+            const rawWeight = gridScore.get(key) || 0;
+
+            // 🔹 weight 0~1 기준
+            // 시설 있는 격자: 0.05~0.7
+            // 시설 없는 격자: 1 → 최대 위험 빨강
+            const weight = rawWeight > 0
+                ? Math.max(MIN_RENDER_WEIGHT, Math.min(0.7, 0.7 - rawWeight))
+                : 1;
+
+            heatSource.addFeature(new ol.Feature({
+                geometry: new ol.geom.Point(center),
                 weight
-            })
-        );
-    });
+            }));
+        }
+    }
 
-    console.log('🔥 성남시 히트맵 포인트 수:', heatSource.getFeatures().length);
+    // 🔹 자연스럽게 연결
+    heatLayer.setRadius(GRID_SIZE / 9);
+    heatLayer.setBlur(GRID_SIZE / 6);
+    heatLayer.changed();
+
+    console.log('🔥 성남시 격자 히트맵 재생성 완료');
 }
 
-/* =========================
-   UI 토글
-========================= */
-document
-    .getElementById('heatmap-layer')
-    .addEventListener('change', e => {
+// =========================
+// 데이터 로딩 연동
+// =========================
+[cctvSource, policeSource, streetSource].forEach(src => {
+    if (!src) return;
+    src.on('addfeature', () => {
+        if (heatLayer.getVisible()) rebuildHeatmapByView();
+    });
+});
+
+// =========================
+// 이동 / 줌
+// =========================
+map.on('moveend', rebuildHeatmapByView);
+
+// =========================
+// UI
+// =========================
+document.getElementById('heatmap-layer')
+    ?.addEventListener('change', e => {
         heatLayer.setVisible(e.target.checked);
-        if (e.target.checked) buildSafetyHeatmap();
+        if (e.target.checked) rebuildHeatmapByView();
+    });
+
+// =========================
+// 버튼 클릭 시 성남시 히트맵 바로 생성
+// =========================
+document.getElementById('show-heatmap-btn')
+    ?.addEventListener('click', () => {
+        heatLayer.setVisible(true);
+        rebuildHeatmapByView();
     });
